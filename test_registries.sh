@@ -1,6 +1,6 @@
 #!/bin/bash
 
-MAX_ATTEMPTS=3
+MAX_ATTEMPTS=1
 TIMEOUT=60
 IMAGE="library/nginx:alpine"
 OUTPUT_CSV="/tmp/registry_speed.csv"
