@@ -14,7 +14,14 @@ echo "Registry,Status,Speed,Time,Integrity" > "$OUTPUT_CSV"
 
 # 解析接口，提取在线的registry url的域名部分
 # 使用jq解析json，需要先确保环境有jq
-registries=$(curl -s 'https://status.anye.xyz/status.json' | jq -r '.[] | select(.status=="online") | .url' | sed -E 's#https?://([^/]+).*#\1#')
+# registries=$(curl -s 'https://status.anye.xyz/status.json' | jq -r '.[] | select(.status=="online") | .url' | sed -E 's#https?://([^/]+).*#\1#')
+# 获取在线且不含“需登陆”标签的registry域名
+registries=$(curl -s 'https://status.anye.xyz/status.json' | jq -r '
+  .[] |
+  select(.status=="online") |
+  select((.tags[]?.name | contains("需登陆") | not)) |
+  .url
+' | sed -E 's#https?://([^/]+).*#\1#')
 
 if [ -z "$registries" ]; then
   echo "未获取到可用的在线 Registry 列表，退出."
