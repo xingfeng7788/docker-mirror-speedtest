@@ -1,85 +1,78 @@
 #!/bin/bash
 
-# 配置参数
 MAX_ATTEMPTS=3
 TIMEOUT=60
+IMAGE="library/nginx:alpine"
+OUTPUT_CSV="/tmp/registry_speed.csv"
 
-# 更新 README.md 的函数
-update_readme() {
-  local registry="$1"
-  local status="$2"
-  local speed="$3"
-  local time="$4"
-  local integrity="$5"
-  sed -i "s#| $registry |.*#| $registry | $status | $speed | $time | $integrity |#" README.md
-}
+# 生成官方镜像的digest，方便后续对比完整性
+docker pull docker.io/$IMAGE > /dev/null 2>&1
+official_digest=$(docker inspect --format='{{index .RepoDigests 0}}' docker.io/$IMAGE | cut -d'@' -f2)
 
-# 测试 registry 的函数
+# 输出 CSV 表头
+echo "Registry,Status,Speed,Time,Integrity" > "$OUTPUT_CSV"
+
+# 解析接口，提取在线的registry url的域名部分
+# 使用jq解析json，需要先确保环境有jq
+registries=$(curl -s 'https://status.anye.xyz/status.json' | jq -r '.[] | select(.status=="online") | .url' | sed -E 's#https?://([^/]+).*#\1#')
+
+if [ -z "$registries" ]; then
+  echo "未获取到可用的在线 Registry 列表，退出."
+  exit 1
+fi
+
+# 测试单个 registry 函数
 test_registry() {
   local registry="$1"
-  local image="$2"
   local attempt=1
-  local output=$(mktemp)
-
-  docker pull docker.io/$image > /dev/null 2>&1
-  official_digest=$(docker inspect --format='{{index .RepoDigests 0}}' docker.io/$image | cut -d'@' -f2)
+  local output
+  output=$(mktemp)
 
   while [ $attempt -le $MAX_ATTEMPTS ]; do
-    echo "Attempt $attempt of $MAX_ATTEMPTS for $registry"
-    if timeout ${TIMEOUT}s bash -c "time docker pull $registry/$image" > "$output" 2>&1; then
-      status="✅ Good"
+    echo "尝试第 $attempt 次，测试 Registry: $registry"
+    # 拉取镜像并计时
+    if timeout ${TIMEOUT}s bash -c "time docker pull $registry/$IMAGE" > "$output" 2>&1; then
+      status="Good"
+      # 获取 real 时间，格式如 0m3.008s 转换为秒数
       pull_time=$(grep real "$output" | awk '{print $2}' | sed 's/0m//;s/s//')
-      image_size=$(docker image inspect "$registry/$image" --format='{{.Size}}' | awk '{print $1/1024/1024}')
-      speed=$(echo "scale=2; $image_size / $pull_time" | bc)
-      echo "$registry is good, Speed: ${speed} MB/s, Time: ${pull_time}s"
-
-      registry_digest=$(docker inspect --format='{{index .RepoDigests 0}}' $registry/$image | cut -d'@' -f2)
-      if [ "$official_digest" = "$registry_digest" ]; then
+      # 获取镜像大小 MB
+      image_size=$(docker image inspect -f '{{.Size}}' $registry/$IMAGE 2>/dev/null | awk '{print $1/1024/1024}')
+      # 计算速度 MB/s 保留两位小数
+      speed=$(echo "scale=2; $image_size / $pull_time" | bc 2>/dev/null || echo "0")
+      # 获取该镜像的digest与官方对比
+      registry_digest=$(docker inspect --format='{{index .RepoDigests 0}}' $registry/$IMAGE 2>/dev/null | cut -d'@' -f2 || echo "")
+      if [ "$official_digest" = "$registry_digest" ] && [ -n "$registry_digest" ]; then
         integrity="✅ Verified"
       else
         integrity="❌ Mismatch"
       fi
 
-      update_readme "$registry" "$status" "${speed} MB/s" "${pull_time}s" "$integrity"
-      echo "$registry,$speed" >> /tmp/registry_speeds.txt
-      rm "$output"
+      echo "$registry,$status,${speed} MB/s,${pull_time}s,$integrity" >> "$OUTPUT_CSV"
+      rm -f "$output"
       return 0
     else
-      echo "$registry failed on attempt $attempt"
+      echo "Registry $registry 第 $attempt 次尝试失败。"
       attempt=$((attempt + 1))
       sleep 5
     fi
   done
 
-  status="❌ Failed"
-  update_readme "$registry" "$status" "-" "-" "-"
-  rm "$output"
+  # 全部尝试失败
+  status="Failed"
+  echo "$registry,❌ $status,-,-,-" >> "$OUTPUT_CSV"
+  rm -f "$output"
   return 1
 }
 
-# 读取 README.md 中的 registry 列表
-registries=$(awk '/\| Registry \| Status \| Speed \| Time \| Integrity \|/,/^$/' README.md | tail -n +3 | sed '/^$/d' | awk -F'|' '{print $2}' | sed 's/^ *//;s/ *$//')
+# 清理本地拉取镜像，避免重复
+docker rmi -f $IMAGE > /dev/null 2>&1 || true
 
-# 测试每个 registry
-image="library/nginx:alpine"
-> /tmp/registry_speeds.txt
 for registry in $registries; do
-  echo "Testing $registry"
-  docker rmi "$registry/$image" > /dev/null 2>&1 || true
-  
-  (
-    test_registry "$registry" "$image"
-    docker rmi "$registry/$image" > /dev/null 2>&1 || true
-  ) || true
+  docker rmi -f $registry/$IMAGE > /dev/null 2>&1 || true
+  test_registry "$registry"
+  docker rmi -f $registry/$IMAGE > /dev/null 2>&1 || true
 done
 
-docker rmi docker.io/$image > /dev/null 2>&1 || true
+docker rmi -f docker.io/$IMAGE > /dev/null 2>&1 || true
 
-# 获取前三快的镜像
-top_three=$(sort -t',' -k2 -nr /tmp/registry_speeds.txt | head -n 3 | cut -d',' -f1 | sed 's/^/"/' | sed 's/$/"/' | tr '\n' ',' | sed 's/,$//')
-
-# 更新 README.md 中的镜像列表
-sed -i '/^     "registry-mirrors": \[/,/^     \]/ c\
-     "registry-mirrors": [\
-             '"$top_three"'\
-     ]' README.md
+echo "测试完成，结果输出到 $OUTPUT_CSV"
